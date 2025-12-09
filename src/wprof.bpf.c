@@ -11,6 +11,11 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+#define DSQ_ID_SPECIAL_MASK 0xc0000000
+#define DSQ_ID_LAYER_SHIFT  16
+#define DSQ_ID_LLC_MASK	    ((1LLU << DSQ_ID_LAYER_SHIFT) - 1) /* 0x0000ffff */
+#define DSQ_ID_LAYER_MASK   (~DSQ_ID_LAYER_SHIFT & ~DSQ_ID_SPECIAL_MASK) /* 0x3fff0000 */
+
 struct task_state {
 	u64 waking_ts;
 	u32 waking_flags;
@@ -25,6 +30,10 @@ struct task_state {
 	struct perf_counters hardirq_ctrs;
 	struct perf_counters softirq_ctrs;
 	struct perf_counters wq_ctrs;
+	u64 dsq_id;
+	u64 dsq_insert_time;
+	u32 layer_id;
+	char dsq_probe_name[20];
 };
 
 struct cpu_state {
@@ -124,23 +133,6 @@ static struct task_state empty_task_state;
 
 u64 session_start_ts;
 u64 session_end_ts;
-
-/* sched-ext specific extensions */
-struct scx_task_ctx {
-	int pid;
-	int last_cpu;
-	u32 layer_id;
-	/* TODO: fetch sched_ext's program BTF and compute the field offset */
-	char skip[136];
-	u64 dsq_id;
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, int);
-	__type(value, struct scx_task_ctx);
-} scx_task_ctxs SEC(".maps");
 
 /* XXX: pass CPU explicitly to avoid unnecessary surprises */
 static __always_inline int task_id(int pid)
@@ -492,6 +484,72 @@ int wprof_timer_tick(void *ctx)
 	return 0;
 }
 
+/* handlers for tracking DSQ insertions - modeled after scxtop's on_insert() */
+static int on_dsq_insert(struct task_struct *p, u64 dsq, const char *probe_name)
+{
+	struct task_state *scur;
+
+	if (!capture_scx_layer_id)
+		return 0;
+
+	if (!p)
+		return 0;
+
+	scur = task_state(p->pid);
+	if (!scur)
+		return 0;
+
+	scur->dsq_insert_time = bpf_ktime_get_ns();
+	scur->dsq_id = dsq;
+	/* NB: layer_id may be bogus if we're not running scx_layered scheduler */
+	scur->layer_id = (dsq & DSQ_ID_LAYER_MASK) >> DSQ_ID_LAYER_SHIFT;
+	__builtin_memcpy(scur->dsq_probe_name, probe_name, sizeof(scur->dsq_probe_name));
+
+	return 0;
+}
+
+SEC("fentry/scx_bpf_dsq_insert")
+int BPF_PROG(wprof_dsq_insert, struct task_struct *p, u64 dsq)
+{
+	return on_dsq_insert(p, dsq, "dsq_insert");
+}
+
+SEC("fentry/scx_bpf_dispatch")
+int BPF_PROG(wprof_dispatch, struct task_struct *p, u64 dsq)
+{
+	return on_dsq_insert(p, dsq, "dispatch");
+}
+
+SEC("fentry/scx_bpf_dsq_insert_vtime")
+int BPF_PROG(wprof_dsq_insert_vtime, struct task_struct *p, u64 dsq, u64 slice_ns, u64 vtime)
+{
+	return on_dsq_insert(p, dsq, "dsq_insert_vt");
+}
+
+SEC("fentry/scx_bpf_dispatch_vtime")
+int BPF_PROG(wprof_dispatch_vtime, struct task_struct *p, u64 dsq, u64 slice_ns, u64 vtime)
+{
+	return on_dsq_insert(p, dsq, "dispatch_vt");
+}
+
+static int handle_dsq(u64 now_ts, struct task_struct *task, struct task_state *s)
+{
+	struct wprof_event *e;
+
+	if (s->dsq_insert_time == 0) /* we never recorded matching start, ignore */
+		return 0;
+
+	emit_task_event(e, EV_SZ(wq), 0, EV_WQ_END, now_ts, task)
+	{
+		u64 data[] = { (u64)&s->dsq_probe_name, s->dsq_id };
+		e->wq.wq_ts = s->dsq_insert_time;
+		bpf_snprintf(e->wq.desc, sizeof(e->wq.desc), "%s_0x%llx", data, sizeof(data));
+	}
+	s->dsq_insert_time = 0;
+
+	return 0;
+}
+
 SEC("tp_btf/sched_switch")
 int BPF_PROG(wprof_task_switch,
 	     bool preempt,
@@ -548,13 +606,9 @@ int BPF_PROG(wprof_task_switch,
 	int scx_layer_id = -1;
 	u64 scx_dsq_id = 0;
 	if (capture_scx_layer_id) {
-		struct scx_task_ctx *scx_ctx;
-
-		scx_ctx = bpf_task_storage_get(&scx_task_ctxs, next, NULL, 0);
-		if (scx_ctx) {
-			scx_layer_id = scx_ctx->layer_id;
-			scx_dsq_id = scx_ctx->dsq_id;
-		}
+		scx_layer_id = snext->layer_id;
+		scx_dsq_id = snext->dsq_id;
+		handle_dsq(now_ts, next, snext);
 	}
 
 	emit_task_event_dyn(e, dptr, fix_sz, tr_out_sz, EV_SWITCH, now_ts, prev) {
@@ -761,7 +815,7 @@ int BPF_PROG(wprof_task_exit, struct task_struct *p)
 	s = task_state_peek(p->pid);
 	if (!s)
 		return 0;
-	
+
 	struct wprof_event *e;
 	emit_task_event(e, EV_SZ(task), 0, EV_TASK_EXIT, now_ts, p);
 
@@ -790,7 +844,7 @@ static int handle_hardirq(u64 now_ts, struct task_struct *task,
 	struct task_state *s;
 	struct wprof_event *e;
 	int cpu;
-	
+
 	s = task_state(task->pid);
 	if (!s)
 		return 0;
@@ -831,7 +885,7 @@ int BPF_PROG(wprof_hardirq_entry, int irq, struct irqaction *action)
 {
 	u64 now_ts = bpf_ktime_get_ns();
 	struct task_struct *task = bpf_get_current_task_btf();
-	
+
 	if (!should_trace_task(task, now_ts))
 		return 0;
 
@@ -843,7 +897,7 @@ int BPF_PROG(wprof_hardirq_exit, int irq, struct irqaction *action, int ret)
 {
 	u64 now_ts = bpf_ktime_get_ns();
 	struct task_struct *task = bpf_get_current_task_btf();
-	
+
 	if (!should_trace_task(task, now_ts))
 		return 0;
 
@@ -855,7 +909,7 @@ static int handle_softirq(u64 now_ts, struct task_struct *task, int vec_nr, bool
 	struct task_state *s;
 	struct wprof_event *e;
 	int cpu;
-	
+
 	s = task_state(task->pid);
 	if (!s)
 		return 0;
@@ -894,7 +948,7 @@ int BPF_PROG(wprof_softirq_entry, int vec_nr)
 {
 	u64 now_ts = bpf_ktime_get_ns();
 	struct task_struct *task = bpf_get_current_task_btf();
-	
+
 	if (!should_trace_task(task, now_ts))
 		return 0;
 
@@ -906,7 +960,7 @@ int BPF_PROG(wprof_softirq_exit, int vec_nr)
 {
 	u64 now_ts = bpf_ktime_get_ns();
 	struct task_struct *task = bpf_get_current_task_btf();
-	
+
 	if (!should_trace_task(task, now_ts))
 		return 0;
 
@@ -983,7 +1037,7 @@ int BPF_PROG(wprof_wq_exec_start, struct work_struct *work)
 {
 	u64 now_ts = bpf_ktime_get_ns();
 	struct task_struct *task = bpf_get_current_task_btf();
-	
+
 	if (!should_trace_task(task, now_ts))
 		return 0;
 
@@ -995,7 +1049,7 @@ int BPF_PROG(wprof_wq_exec_end, struct work_struct *work /* , work_func_t functi
 {
 	u64 now_ts = bpf_ktime_get_ns();
 	struct task_struct *task = bpf_get_current_task_btf();
-	
+
 	if (!should_trace_task(task, now_ts))
 		return 0;
 
