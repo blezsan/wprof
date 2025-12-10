@@ -508,25 +508,25 @@ static int on_dsq_insert(struct task_struct *p, u64 dsq, const char *probe_name)
 	return 0;
 }
 
-SEC("fentry/scx_bpf_dsq_insert")
+SEC("?fentry/scx_bpf_dsq_insert")
 int BPF_PROG(wprof_dsq_insert, struct task_struct *p, u64 dsq)
 {
 	return on_dsq_insert(p, dsq, "dsq_insert");
 }
 
-SEC("fentry/scx_bpf_dispatch")
+SEC("?fentry/scx_bpf_dispatch")
 int BPF_PROG(wprof_dispatch, struct task_struct *p, u64 dsq)
 {
 	return on_dsq_insert(p, dsq, "dispatch");
 }
 
-SEC("fentry/scx_bpf_dsq_insert_vtime")
+SEC("?fentry/scx_bpf_dsq_insert_vtime")
 int BPF_PROG(wprof_dsq_insert_vtime, struct task_struct *p, u64 dsq, u64 slice_ns, u64 vtime)
 {
 	return on_dsq_insert(p, dsq, "dsq_insert_vt");
 }
 
-SEC("fentry/scx_bpf_dispatch_vtime")
+SEC("?fentry/scx_bpf_dispatch_vtime")
 int BPF_PROG(wprof_dispatch_vtime, struct task_struct *p, u64 dsq, u64 slice_ns, u64 vtime)
 {
 	return on_dsq_insert(p, dsq, "dispatch_vt");

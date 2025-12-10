@@ -1061,8 +1061,12 @@ static int setup_bpf(struct bpf_state *st, struct worker_state *workers, int num
 	}
 
 	if (env.capture_scx_layer_info) {
-		/* We use our own task_data map for SCX tracking, no need to reuse external map */
-		vprintf("Using internal task_data map for sched-ext layer tracking.\n");
+		bpf_program__set_autoload(skel->progs.wprof_dsq_insert, true);
+		bpf_program__set_autoload(skel->progs.wprof_dispatch, true);
+		bpf_program__set_autoload(skel->progs.wprof_dsq_insert_vtime, true);
+		bpf_program__set_autoload(skel->progs.wprof_dispatch_vtime, true);
+		/* We use our own task_states map for SCX tracking, no need to reuse external map */
+		vprintf("Using internal task_states map for sched-ext DSQ/layer tracking.\n");
 	}
 
 	skel->rodata->capture_scx_layer_id = env.capture_scx_layer_info == TRUE;
