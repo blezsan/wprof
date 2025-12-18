@@ -27,6 +27,8 @@ BPFTOOL ?= $(BPFTOOL_OUTPUT)/bootstrap/bpftool
 LIBBLAZESYM_SRC := $(abspath ../blazesym/)
 LIBBLAZESYM_INC := $(abspath $(LIBBLAZESYM_SRC)/capi/include)
 LIBBLAZESYM_OBJ := $(abspath $(OUTPUT)/libblazesym_c.a)
+LIBDEMANGLE_SRC := $(abspath demangle/)
+LIBDEMANGLE_OBJ := $(abspath $(OUTPUT)/libdemangle_c.a)
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' \
 			 | sed 's/arm.*/arm/' \
 			 | sed 's/aarch64/arm64/' \
@@ -43,20 +45,6 @@ CFLAGS ?= -g -O$(if $(DEBUG),0,2) -Wall
 ALL_CFLAGS := $(CFLAGS) $(EXTRA_CFLAGS) -fno-omit-frame-pointer				\
 	      -Wno-c23-extensions -Wno-sign-compare -Wno-format-truncation
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS) -lrt -ldl -lpthread -lm
-
-# We seem to need the following packages (on CentOS) to get all necessary headers:
-#   - cuda-nvcc-<version>;
-#   - cuda-cudart-devel-<version>;
-#   - cuda-cupti-<version>
-CUPTI_PATHS := /usr/local/cuda*/targets/*/include
-
-# Auto-detect CUPTI if not specified
-CUPTI_INCLUDE ?= $(shell								\
-	for p in $(CUPTI_PATHS); do 							\
-		[ -f "$$p/cupti_activity.h" ] && [ -f "$$p/cuda.h" ] && echo $$p;	\
-	 done | sort -Vr | head -n1)
-INCLUDES += $(if $(CUPTI_INCLUDE),-I$(CUPTI_INCLUDE))
-ALL_CFLAGS += $(if $(CUPTI_INCLUDE),-DHAVE_CUPTI)
 
 # Get Clang's default includes on this system. We'll explicitly add these dirs
 # to the includes list when compiling with `-target bpf` because otherwise some
@@ -118,12 +106,20 @@ $(BPFTOOL): | $(BPFTOOL_OUTPUT)
 
 # Build blazesym
 $(LIBBLAZESYM_SRC)/target/$(if $(BLAZESYM_DEBUG),debug,release)/libblazesym_c.a::
+	$(call msg,LIB,$@)
 	$(Q) [ -d ../blazesym/src ] || git submodule update --init --recursive
-	$(Q)cd $(LIBBLAZESYM_SRC) && $(CARGO) build --package=blazesym-c $(if $(BLAZESYM_DEBUG),,--release)
+	$(Q)cd $(LIBBLAZESYM_SRC) && $(CARGO) build --package=blazesym-c -q $(if $(BLAZESYM_DEBUG),,--release)
 
 $(LIBBLAZESYM_OBJ): $(LIBBLAZESYM_SRC)/target/$(if $(BLAZESYM_DEBUG),debug,release)/libblazesym_c.a | $(OUTPUT)
-	$(call msg,LIB, $@)
 	$(Q)cp $(LIBBLAZESYM_SRC)/target/$(if $(BLAZESYM_DEBUG),debug,release)/libblazesym_c.a $@
+
+# Build demangle shim
+$(LIBDEMANGLE_SRC)/target/release/libdemangle_c.a::
+	$(call msg,LIB,$@)
+	$(Q)cd $(LIBDEMANGLE_SRC) && $(CARGO) build --release -q
+
+$(LIBDEMANGLE_OBJ): $(LIBDEMANGLE_SRC)/target/release/libdemangle_c.a | $(OUTPUT)
+	$(Q)cp $< $@
 
 # Build BPF code
 $(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) $(VMLINUX) | $(OUTPUT) $(BPFTOOL)
@@ -146,27 +142,15 @@ $(OUTPUT)/wprof.skel.h: $(OUTPUT)/wprof.bpf.o $(OUTPUT)/utils.bpf.o $(OUTPUT)/sc
 WPROF_SRCS := wprof.c utils.c env.c protobuf.c emit.c stacktrace.c				\
 	      pb_common.c pb_encode.c perfetto_trace.pb.c topology.c proc.c			\
 	      requests.c cuda.c inject.c sys.c elf_utils.c					\
-	      $(if $(CUPTI_INCLUDE),cupti_driver_cbid_map.gen.c cupti_runtime_cbid_map.gen.c)
+	      cupti_driver_cbid_map.gen.c cupti_runtime_cbid_map.gen.c
 WPROF_HDRS := wprof.h utils.h env.h protobuf.h emit.h stacktrace.h data.h topology.h		\
 	      proc.h requests.h cuda.h inj_common.h inject.h sys.h elf_utils.h cuda_data.h 	\
-	      wprof_types.h
+	      wprof_types.h demangle.h
 WPROF_OBJS := $(patsubst %.c,$(OUTPUT)/%.o,$(WPROF_SRCS))
 
-WPROFINJ_SRCS := inj_lib.c inj_strset.c inj_hashmap.c $(if $(CUPTI_INCLUDE),inj_cupti.c)
-WPROFINJ_HDRS := inj_common.h inj.h
+WPROFINJ_SRCS := inj_lib.c inj_strset.c inj_hashmap.c inj_cupti.c
+WPROFINJ_HDRS := inj_common.h inj.h wprof_cupti.h
 WPROFINJ_OBJS := $(patsubst %.c,$(OUTPUT)/%.o,$(WPROFINJ_SRCS))
-
-ifneq ($(CUPTI_INCLUDE),)
-cupti_driver_cbid_map.gen.c: $(CUPTI_INCLUDE)/cupti_driver_cbid.h gen_cupti_driver_cbid.awk | $(OUTPUT)
-	$(call msg,GEN,$@)
-	$(Q)$(AWK) -f gen_cupti_driver_cbid.awk <$(CUPTI_INCLUDE)/cupti_driver_cbid.h >$@
-
-cupti_runtime_cbid_map.gen.c: $(CUPTI_INCLUDE)/cupti_runtime_cbid.h gen_cupti_runtime_cbid.awk | $(OUTPUT)
-	$(call msg,GEN,$@)
-	$(Q)$(AWK) -f gen_cupti_runtime_cbid.awk <$(CUPTI_INCLUDE)/cupti_runtime_cbid.h >$@
-else
-$(warning "WARNING! CUDA tracing won't be compiled due to missing CUPTI headers, check CUPTI_INCLUDE!")
-endif
 
 $(WPROFINJ_OBJS): ALL_CFLAGS += -fPIC
 $(WPROFINJ_OBJS): INCLUDES += -I../libbpf/src
@@ -193,14 +177,14 @@ $(OUTPUT)/libwprofinj_embed.o: $(OUTPUT)/libwprofinj.so
 # Build application binary
 wprof: $(WPROF_HDRS) $(WPROF_OBJS)								\
 		$(OUTPUT)/libwprofinj_embed.o							\
-		$(LIBBPF_OBJ) $(LIBBLAZESYM_OBJ) | $(OUTPUT)
+		$(LIBBPF_OBJ) $(LIBBLAZESYM_OBJ) $(LIBDEMANGLE_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(ALL_CFLAGS) $(filter %.c %.a %.o,$^) $(ALL_LDFLAGS) $(if $(STATIC),--static) -lelf -lz -lzstd -o $@
 
 .PHONY: clean
 clean:
 	$(call msg,CLEAN)
-	$(Q)rm -rf $(OUTPUT)/*.o $(OUTPUT)/libwprofinj.* cupti_*.gen.c wprof
+	$(Q)rm -rf $(OUTPUT)/*.o $(OUTPUT)/libwprofinj.* wprof
 
 .PHONY: clean-all
 clean-all: clean

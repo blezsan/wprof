@@ -16,6 +16,7 @@
 #include "env.h"
 #include "stacktrace.h"
 #include "cuda_data.h"
+#include "demangle.h"
 
 enum task_run_state {
 	TASK_STATE_RUNNING,
@@ -36,6 +37,7 @@ struct task_state {
 	u64 oncpu_ts;
 	u64 offcpu_ts;
 	u64 req_id; /* active ongoing request ID */
+	u32 waker_callstack_id;
 	/* perf counters */
 	struct perf_counters oncpu_ctrs;
 	u64 compound_delay_ns; /* scheduling/running delay, including dependency tasks' ones */
@@ -179,6 +181,7 @@ struct emit_state {
 	struct pb_anns anns;
 	struct pb_str_iids str_iids;
 	struct pb_id_set flow_ids;
+	int callstack_iid;
 };
 
 static __thread struct emit_state em;
@@ -227,6 +230,15 @@ static void emit_flow_id(u64 flow_id)
 }
 
 __unused
+static void emit_callstack(struct worker_state *w, int iid)
+{
+	if (iid <= 0)
+		return;
+	mark_stack_trace_used(w, iid);
+	em.callstack_iid = iid;
+}
+
+__unused
 static void emit_str_iid(pb_iid iid, const char *key)
 {
 	append_str_iid(&em.str_iids, iid, key);
@@ -251,12 +263,18 @@ static void emit_trace_packet(pb_ostream_t *stream, TracePacket *pb)
 	}
 
 	if (em.flow_ids.cnt > 0)
-		em.pb.data.track_event.flow_ids = PB_FLOW_IDS(&em.flow_ids);
+		pb->data.track_event.flow_ids = PB_FLOW_IDS(&em.flow_ids);
+
+	if (em.callstack_iid > 0) {
+		pb->data.track_event.which_callstack_field = perfetto_protos_TrackEvent_callstack_iid_tag;
+		pb->data.track_event.callstack_field.callstack_iid = em.callstack_iid;
+	}
 
 	enc_trace_packet(stream, pb);
 
 	reset_str_iids(&em.str_iids);
 	ids_reset(&em.flow_ids);
+	em.callstack_iid = 0;
 }
 
 static void emit_cleanup(struct emit_rec *r)
@@ -652,20 +670,6 @@ static struct emit_rec emit_counter_pre(u64 ts, const struct wprof_task *t,
 	     emit_counter_pre(ts, t, name_iid, name);						\
 	     !___r.done; ___r.done = true)
 
-static void emit_stack_trace(u64 ts, const struct wprof_task *t, int stack_id)
-{
-	TracePacket pb = (TracePacket) {
-		PB_INIT(timestamp) = ts - env.sess_start_ts,
-		PB_TRUST_SEQ_ID(PB_SEQ_ID_THREADS),
-		PB_ONEOF(data, TracePacket_perf_sample) = { .perf_sample = {
-			PB_INIT(pid) = track_pid(t),
-			PB_INIT(tid) = track_tid(t),
-			PB_INIT(callstack_iid) = stack_id,
-		}},
-	};
-	emit_trace_packet(cur_stream, &pb);
-}
-
 static bool kind_track_emitted[] = {
 	[TASK_IDLE] = false,
 	[TASK_KWORKER] = false,
@@ -762,6 +766,17 @@ static pb_iid emit_intern_str(struct worker_state *w, const char *s)
 	if (new_iid)
 		emit_str_iid(iid, iid_str);
 	return iid;
+}
+
+static struct task_state *task_state_try_get(struct worker_state *w, const struct wprof_task *t)
+{
+	unsigned long key = t->tid;
+	struct task_state *st;
+
+	if (hashmap__find(tasks, key, &st))
+		return st;
+
+	return NULL;
 }
 
 static struct task_state *task_state(struct worker_state *w, const struct wprof_task *t)
@@ -908,19 +923,16 @@ static int process_timer(struct worker_state *w, struct wprof_event *e, size_t s
 
 	(void)task_state(w, &e->task);
 
-	if (env.emit_timer_ticks) {
+	int tr_id = event_stack_trace_id(w, e, ST_TIMER);
+
+	if (env.emit_timer_ticks || tr_id > 0) {
 		/* task keeps running on CPU */
 		emit_instant(e->ts, &e->task, IID_NAME_TIMER, IID_CAT_TIMER) {
 			emit_kv_int(IID_ANNK_CPU, e->cpu);
 			if (env.emit_numa)
 				emit_kv_int(IID_ANNK_NUMA_NODE, e->numa_node);
+			emit_callstack(w, tr_id);
 		}
-	}
-
-	int tr_id = event_stack_trace_id(w, e, ST_TIMER);
-	if (tr_id > 0) {
-		mark_stack_trace_used(w, tr_id);
-		emit_stack_trace(e->ts, &e->task, tr_id);
 	}
 
 	return 0;
@@ -1018,6 +1030,12 @@ static int process_switch(struct worker_state *w, struct wprof_event *e, size_t 
 		}
 
 		emit_flow_id(e->swtch.waking_ts);
+
+		struct task_state *wakee_st = task_state_try_get(w, &e->swtch.next);
+		if (wakee_st) {
+			emit_callstack(w, wakee_st->waker_callstack_id);
+			wakee_st->waker_callstack_id = 0;
+		}
 	}
 
 skip_waker_task:
@@ -1078,14 +1096,9 @@ skip_waker_task:
 
 		if (prev_st->rename_ts)
 			emit_kv_str(IID_ANNK_RENAMED_TO, e->task.comm);
-	}
 
-	if (env.requested_stack_traces & ST_OFFCPU) {
-		int tr_id = event_stack_trace_id(w, e, ST_OFFCPU);
-		if (tr_id > 0) {
-			mark_stack_trace_used(w, tr_id);
-			emit_stack_trace(e->ts, &e->task, tr_id);
-		}
+		if (env.requested_stack_traces & ST_OFFCPU)
+			emit_callstack(w, event_stack_trace_id(w, e, ST_OFFCPU));
 	}
 
 	if (prev_st->req_id) {
@@ -1419,10 +1432,11 @@ static int process_wakeup_new(struct worker_state *w, struct wprof_event *e, siz
 	(void)task_state(w, &e->task);
 
 	int tr_id = event_stack_trace_id(w, e, ST_WAKER);
-	if (tr_id > 0) {
-		mark_stack_trace_used(w, tr_id);
-		emit_stack_trace(e->ts, &e->task, tr_id);
-	}
+	if (tr_id <= 0)
+		return 0;
+
+	struct task_state *wakee_st = task_state(w, &e->wakeup_new.wakee);
+	wakee_st->waker_callstack_id = tr_id;
 
 	return 0;
 }
@@ -1436,10 +1450,11 @@ static int process_waking(struct worker_state *w, struct wprof_event *e, size_t 
 	(void)task_state(w, &e->task);
 
 	int tr_id = event_stack_trace_id(w, e, ST_WAKER);
-	if (tr_id > 0) {
-		mark_stack_trace_used(w, tr_id);
-		emit_stack_trace(e->ts, &e->task, tr_id);
-	}
+	if (tr_id <= 0)
+		return 0;
+
+	struct task_state *wakee_st = task_state(w, &e->waking.wakee);
+	wakee_st->waker_callstack_id = tr_id;
 
 	return 0;
 }
@@ -1893,6 +1908,49 @@ static bool is_time_range_in_session(u64 start_ts, u64 end_ts)
 	return true;
 }
 
+/*
+ * Simplify a demangled C++ function name by stripping template parameters,
+ * anonymous namespace markers, and function arguments, in place. Examples:
+ *   "foo::bar<int, std::vector<char>>::baz(int, char*)" -> "foo::bar::baz"
+ *   "foo::(anonymous namespace)::bar(void)" -> "foo::::bar"
+ */
+static void simplify_demangled_name(char *name)
+{
+	int i, j, nest_lvl = 0;
+
+	for (i = 0, j = 0; name[i]; i++) {
+		/* blah<whatever> -> blah (handles nested templates) */
+		if (name[i] == '<') {
+			nest_lvl++;
+			continue;
+		}
+		if (name[i] == '>') {
+			nest_lvl--;
+			continue;
+		}
+		/* ::(anonymous namespace):: -> :::: */
+		if (i >= 2 && name[i] == '(' && name[i - 1] == ':' && name[i - 2] == ':') {
+			nest_lvl++;
+			continue;
+		}
+		if (name[i] == ')' && name[i + 1] == ':' && name[i + 2] == ':') {
+			nest_lvl--;
+			continue;
+		}
+
+		/* func(args...) -> func (stop at top-level opening paren) */
+		if (nest_lvl == 0 && name[i] == '(') {
+			break;
+		}
+
+		if (nest_lvl == 0) {
+			name[j] = name[i];
+			j++;
+		}
+	}
+	name[j] = '\0';
+}
+
 /* WCK_CUDA_KERNEL */
 static int process_cuda_kernel(struct worker_state *w, struct wprof_event *e, size_t size)
 {
@@ -1910,10 +1968,23 @@ static int process_cuda_kernel(struct worker_state *w, struct wprof_event *e, si
 
 	const char *strs = (void *)w->dump_hdr + w->dump_hdr->hdr_sz + w->dump_hdr->strs_off;
 	const char *cuda_kern_name = strs + cu->name_off;
-	pb_iid name_iid = emit_intern_str(w, cuda_kern_name);
+
+	char demangled_buf[4096];
+	const char *cuda_kern_name_demangled = NULL;
+	if (demangle_symbol(cuda_kern_name, demangled_buf, sizeof(demangled_buf)) >= 0) {
+		simplify_demangled_name(demangled_buf);
+		cuda_kern_name_demangled = demangled_buf;
+	}
+
+	const char *name = cuda_kern_name_demangled ?: cuda_kern_name;
+	pb_iid name_iid = emit_intern_str(w, name);
 
 	emit_track_slice_start(clamp_ts(e->ts), track_uuid,
-			       iid_str(name_iid, cuda_kern_name), IID_CAT_CUDA_KERNEL) {
+			       iid_str(name_iid, name), IID_CAT_CUDA_KERNEL) {
+		if (name != cuda_kern_name) {
+			pb_iid mangled_name_iid = emit_intern_str(w, cuda_kern_name);
+			emit_kv_str(IID_ANNK_CUDA_MANGLED_NAME, iid_str(mangled_name_iid, cuda_kern_name));
+		}
 		emit_kv_int(IID_ANNK_CUDA_DEVICE_ID, cu->device_id);
 		emit_kv_int(IID_ANNK_CUDA_STREAM_ID, cu->stream_id);
 		emit_kv_int(IID_ANNK_CUDA_CONTEXT_ID, cu->ctx_id);
@@ -1928,7 +1999,7 @@ static int process_cuda_kernel(struct worker_state *w, struct wprof_event *e, si
 	}
 
 	emit_track_slice_end(clamp_ts(cu->end_ts), track_uuid,
-			     iid_str(name_iid, cuda_kern_name), IID_CAT_CUDA_KERNEL);
+			     iid_str(name_iid, name), IID_CAT_CUDA_KERNEL);
 
 	return 0;
 }
