@@ -11,31 +11,6 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
-#define DSQ_ID_SPECIAL_MASK 0xc0000000
-#define DSQ_ID_LAYER_SHIFT  16
-#define DSQ_ID_LLC_MASK	    ((1LLU << DSQ_ID_LAYER_SHIFT) - 1) /* 0x0000ffff */
-#define DSQ_ID_LAYER_MASK   (~DSQ_ID_LAYER_SHIFT & ~DSQ_ID_SPECIAL_MASK) /* 0x3fff0000 */
-
-struct task_state {
-	u64 waking_ts;
-	u32 waking_flags;
-	u32 waker_cpu;
-	u32 waker_numa_node;
-	u32 last_task_state;
-	struct wprof_task waker_task;
-	u64 softirq_ts;
-	u64 hardirq_ts;
-	u64 wq_ts;
-	char wq_name[WORKER_DESC_LEN];
-	struct perf_counters hardirq_ctrs;
-	struct perf_counters softirq_ctrs;
-	struct perf_counters wq_ctrs;
-	u64 dsq_id;
-	u64 dsq_insert_time;
-	u32 layer_id;
-	char dsq_probe_name[20];
-};
-
 struct cpu_state {
 	u64 ipi_counter;
 	u64 ipi_ts;
@@ -141,7 +116,7 @@ static __always_inline int task_id(int pid)
 	return pid ?: -(bpf_get_smp_processor_id() + 1);
 }
 
-static struct task_state *task_state(int pid)
+__hidden struct task_state *task_state(int pid)
 {
 	struct task_state *s;
 	int id = task_id(pid);
@@ -449,6 +424,16 @@ static __always_inline bool init_wprof_event(struct wprof_event *e, u32 sz, enum
 	     e && __ctx.ev && init_wprof_event(e, fix_sz /*+ dyn_sz*/, kind, ts, task);		\
 	     __ctx.ev = NULL)
 
+void emit_wq_event(u64 start_ts, u64 end_ts, struct task_struct *task, const char *label)
+{
+	struct wprof_event *e;
+
+	emit_task_event(e, EV_SZ(wq), 0, EV_WQ_END, end_ts, task)
+	{
+		e->wq.wq_ts = start_ts;
+		__builtin_memcpy(e->wq.desc, label, sizeof(e->wq.desc));
+	}
+}
 
 SEC("?perf_event")
 int wprof_timer_tick(void *ctx)
@@ -480,72 +465,6 @@ int wprof_timer_tick(void *ctx)
 			e->flags |= ST_TIMER;
 		}
 	}
-
-	return 0;
-}
-
-/* handlers for tracking DSQ insertions - modeled after scxtop's on_insert() */
-static int on_dsq_insert(struct task_struct *p, u64 dsq, const char *probe_name)
-{
-	struct task_state *scur;
-
-	if (!capture_scx_layer_id)
-		return 0;
-
-	if (!p)
-		return 0;
-
-	scur = task_state(p->pid);
-	if (!scur)
-		return 0;
-
-	scur->dsq_insert_time = bpf_ktime_get_ns();
-	scur->dsq_id = dsq;
-	/* NB: layer_id may be bogus if we're not running scx_layered scheduler */
-	scur->layer_id = (dsq & DSQ_ID_LAYER_MASK) >> DSQ_ID_LAYER_SHIFT;
-	__builtin_memcpy(scur->dsq_probe_name, probe_name, sizeof(scur->dsq_probe_name));
-
-	return 0;
-}
-
-SEC("?fentry/scx_bpf_dsq_insert")
-int BPF_PROG(wprof_dsq_insert, struct task_struct *p, u64 dsq)
-{
-	return on_dsq_insert(p, dsq, "dsq_insert");
-}
-
-SEC("?fentry/scx_bpf_dispatch")
-int BPF_PROG(wprof_dispatch, struct task_struct *p, u64 dsq)
-{
-	return on_dsq_insert(p, dsq, "dispatch");
-}
-
-SEC("?fentry/scx_bpf_dsq_insert_vtime")
-int BPF_PROG(wprof_dsq_insert_vtime, struct task_struct *p, u64 dsq, u64 slice_ns, u64 vtime)
-{
-	return on_dsq_insert(p, dsq, "dsq_insert_vt");
-}
-
-SEC("?fentry/scx_bpf_dispatch_vtime")
-int BPF_PROG(wprof_dispatch_vtime, struct task_struct *p, u64 dsq, u64 slice_ns, u64 vtime)
-{
-	return on_dsq_insert(p, dsq, "dispatch_vt");
-}
-
-static int handle_dsq(u64 now_ts, struct task_struct *task, struct task_state *s)
-{
-	struct wprof_event *e;
-
-	if (s->dsq_insert_time == 0) /* we never recorded matching start, ignore */
-		return 0;
-
-	emit_task_event(e, EV_SZ(wq), 0, EV_WQ_END, now_ts, task)
-	{
-		u64 data[] = { (u64)&s->dsq_probe_name, s->dsq_id };
-		e->wq.wq_ts = s->dsq_insert_time;
-		bpf_snprintf(e->wq.desc, sizeof(e->wq.desc), "%s_0x%llx", data, sizeof(data));
-	}
-	s->dsq_insert_time = 0;
 
 	return 0;
 }
