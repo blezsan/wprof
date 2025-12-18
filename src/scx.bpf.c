@@ -82,3 +82,59 @@ __hidden int handle_dsq(u64 now_ts, struct task_struct *task, struct task_state 
 
 	return 0;
 }
+
+static int on_dsq_move(struct task_struct *p, u64 dsq, const char *probe_name)
+{
+	struct task_state *scur;
+	u64 now_ts;
+
+	if (!capture_scx_layer_id)
+		return 0;
+
+	if (!p)
+		return 0;
+
+	scur = task_state(p->pid);
+	if (!scur)
+		return 0;
+
+	now_ts = bpf_ktime_get_ns();
+	/* record data for previous dsq for this task */
+	handle_dsq(now_ts, p, scur);
+
+	scur->dsq_insert_time = now_ts;
+	scur->dsq_id = dsq;
+	/* NB: layer_id may be bogus if we're not running scx_layered scheduler */
+	scur->layer_id = (dsq & DSQ_ID_LAYER_MASK) >> DSQ_ID_LAYER_SHIFT;
+	__builtin_memcpy(scur->dsq_probe_name, probe_name, sizeof(scur->dsq_probe_name));
+
+	return 0;
+}
+
+SEC("?fentry/scx_bpf_dsq_move")
+int BPF_PROG(wprof_dsq_move, void *it__iter,
+         struct task_struct *p, u64 dsq_id, u64 enq_flags)
+{
+  return on_dsq_move(p, dsq_id, "dsq_move");
+}
+
+SEC("?fentry/scx_bpf_dispatch_from_dsq")
+int BPF_PROG(wprof_dispatch_from_dsq, void *it__iter,
+         struct task_struct *p, u64 dsq_id, u64 enq_flags)
+{
+  return on_dsq_move(p, dsq_id, "dispatch_from_dsq");
+}
+
+SEC("?fentry/scx_bpf_dsq_move_vtime")
+int BPF_PROG(wprof_dsq_move_vtime, void *it__iter,
+         struct task_struct *p, u64 dsq_id, u64 enq_flags)
+{
+  return on_dsq_move(p, dsq_id, "dsq_move_vt");
+}
+
+SEC("?fentry/scx_bpf_dispatch_vtime_from_dsq")
+int BPF_PROG(wprof_dispatch_vtime_from_dsq, void *it__iter,
+         struct task_struct *p, u64 dsq_id, u64 enq_flags)
+{
+  return on_dsq_move(p, dsq_id, "dispatch_vt_from_dsq");
+}

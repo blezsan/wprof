@@ -22,6 +22,7 @@
 #include <linux/perf_event.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <bpf/btf.h>
 #include <time.h>
 #include <sys/time.h>
 #include <sys/signal.h>
@@ -1061,12 +1062,35 @@ static int setup_bpf(struct bpf_state *st, struct worker_state *workers, int num
 	}
 
 	if (env.capture_scx_layer_info) {
-		bpf_program__set_autoload(skel->progs.wprof_dsq_insert, true);
-		bpf_program__set_autoload(skel->progs.wprof_dispatch, true);
-		bpf_program__set_autoload(skel->progs.wprof_dsq_insert_vtime, true);
-		bpf_program__set_autoload(skel->progs.wprof_dispatch_vtime, true);
-		/* We use our own task_states map for SCX tracking, no need to reuse external map */
-		vprintf("Using internal task_states map for sched-ext DSQ/layer tracking.\n");
+		struct btf *vmlinux_btf = btf__parse("/sys/kernel/btf/vmlinux", NULL);
+
+		if (!vmlinux_btf) {
+			eprintf("Failed to parse /sys/kernel/btf/vmlinux, disabling SCX layer/DSQ capture\n");
+		} else {
+			if (btf__find_by_name_kind(vmlinux_btf, "scx_bpf_dsq_insert", BTF_KIND_FUNC) < 0) {
+				bpf_program__set_autoload(skel->progs.wprof_dispatch, true);
+			} else {
+				bpf_program__set_autoload(skel->progs.wprof_dsq_insert, true);
+			}
+			if (btf__find_by_name_kind(vmlinux_btf, "scx_bpf_dsq_insert_vtime", BTF_KIND_FUNC) < 0) {
+				bpf_program__set_autoload(skel->progs.wprof_dispatch_vtime, true);
+			} else {
+				bpf_program__set_autoload(skel->progs.wprof_dsq_insert_vtime, true);
+			}
+			if (btf__find_by_name_kind(vmlinux_btf, "scx_bpf_dsq_move", BTF_KIND_FUNC) < 0) {
+				bpf_program__set_autoload(skel->progs.wprof_dispatch_from_dsq, true);
+			} else {
+				bpf_program__set_autoload(skel->progs.wprof_dsq_move, true);
+			}
+			if (btf__find_by_name_kind(vmlinux_btf, "scx_bpf_dsq_move_vtime", BTF_KIND_FUNC) < 0) {
+				bpf_program__set_autoload(skel->progs.wprof_dispatch_vtime_from_dsq, true);
+			} else {
+				bpf_program__set_autoload(skel->progs.wprof_dsq_move_vtime, true);
+			}
+			btf__free(vmlinux_btf);
+			/* We use our own task_states map for SCX tracking, no need to reuse external map */
+			vprintf("Using internal task_states map for sched-ext DSQ/layer tracking.\n");
+		}
 	}
 
 	skel->rodata->capture_scx_layer_id = env.capture_scx_layer_info == TRUE;
