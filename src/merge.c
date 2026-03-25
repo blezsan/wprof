@@ -19,6 +19,7 @@
 #include "cuda_data.h"
 #include "proc.h"
 #include "persist.h"
+#include "usdt.h"
 #include "stacktrace.h"
 #include "../libbpf/src/strset.h"
 #include "../libbpf/src/hashmap.h"
@@ -137,6 +138,9 @@ int wprof_merge_data(const char *workdir_name, struct worker_state *workers)
 		persist_add_pmu_def(&ps, &env.pmu_reals[i]);
 	for (int i = 0; i < env.pmu_deriv_cnt; i++)
 		persist_add_pmu_def(&ps, &env.pmu_derivs[i]);
+
+	for (int i = 0; i < env.usdt_probe_cnt; i++)
+		persist_add_usdt_def(&ps, env.usdt_probes[i].provider, env.usdt_probes[i].name);
 
 	/* Finalize and mmap() per-ringbuf dumps */
 	for (int i = 0; i < env.ringbuf_cnt; i++) {
@@ -498,6 +502,22 @@ int wprof_merge_data(const char *workdir_name, struct worker_state *workers)
 	/* ensure string section ends at 8 byte alignment, just in case */
 	file_pad(data_dump, 8);
 
+	/* Write USDT probe definitions section */
+	long usdt_defs_off = 0;
+	size_t usdt_defs_sz = 0;
+	u32 usdt_def_cnt = ps.usdt_def_cnt;
+	if (usdt_def_cnt > 0) {
+		file_pad(data_dump, 8);
+		usdt_defs_off = ftell(data_dump) - sizeof(struct wprof_data_hdr);
+		usdt_defs_sz = usdt_def_cnt * sizeof(struct wevent_usdt_def);
+		if (fwrite(ps.usdt_defs, sizeof(struct wevent_usdt_def),
+			   usdt_def_cnt, data_dump) != usdt_def_cnt) {
+			err = -errno;
+			eprintf("Failed to fwrite() USDT definitions: %d\n", err);
+			return err;
+		}
+	}
+
 	fflush(data_dump);
 	fsync(fileno(data_dump));
 
@@ -569,6 +589,10 @@ int wprof_merge_data(const char *workdir_name, struct worker_state *workers)
 
 	hdr.stacks_off = stacks_off;
 	hdr.stacks_sz = stacks_sz;
+
+	hdr.usdt_defs_off = usdt_defs_off;
+	hdr.usdt_defs_sz = usdt_defs_sz;
+	hdr.usdt_def_cnt = usdt_def_cnt;
 
 	err = fseek(data_dump, 0, SEEK_SET);
 	if (err) {

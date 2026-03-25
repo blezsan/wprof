@@ -172,6 +172,7 @@ static const char *pb_static_strs[] = {
 	[IID_CAT_CUDA_MEMSET] = "CUDA_MEMSET",
 	[IID_CAT_CUDA_SYNC] = "CUDA_SYNC",
 	[IID_CAT_SCX_DSQ] = "SCX_DSQ",
+	[IID_CAT_USDT] = "USDT",
 
 	[IID_NAME_TIMER] = "TIMER",
 	[IID_NAME_EXEC] = "EXEC",
@@ -304,6 +305,10 @@ static const char *pb_static_strs[] = {
 	[IID_ANNK_CUDA_EVENT_ID] = "event_id",
 	[IID_ANNK_CUDA_MANGLED_NAME] = "mangled_name",
 	[IID_ANNK_CUDA_GPU_DELAY_US] = "gpu_delay_us",
+	[IID_ANNK_USDT_ARG0] = "arg0",
+	[IID_ANNK_USDT_ARG1] = "arg1",
+	[IID_ANNK_USDT_ARG2] = "arg2",
+	[IID_ANNK_USDT_ARG3] = "arg3",
 
 	[IID_ANNV_SOFTIRQ_ACTION + HI_SOFTIRQ] = "hi",
 	[IID_ANNV_SOFTIRQ_ACTION + TIMER_SOFTIRQ] = "timer",

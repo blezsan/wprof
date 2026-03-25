@@ -153,6 +153,11 @@ struct wevent {
 			enum scx_dsq_insert_type scx_dsq_insert_type;
 		} scx_dsq;
 
+		struct wevent_usdt {
+			u64 arg0, arg1, arg2, arg3;
+			u16 usdt_id;
+		} usdt;
+
 		/* CUDA activity events (from CUPTI) */
 		struct wevent_cuda_api { /* host-side CUDA API call */
 			u64 end_ts;
@@ -235,6 +240,7 @@ static inline size_t wevent_fixed_sz(const struct wevent *e)
 	case EV_REQ_EVENT:	return WEVENT_SZ(req);
 	case EV_REQ_TASK_EVENT:	return WEVENT_SZ(req_task);
 	case EV_SCX_DSQ_END:	return WEVENT_SZ(scx_dsq);
+	case EV_USDT:		return WEVENT_SZ(usdt);
 	case EV_CUDA_KERNEL:	return WEVENT_SZ(cuda_kernel);
 	case EV_CUDA_MEMCPY:	return WEVENT_SZ(cuda_memcpy);
 	case EV_CUDA_MEMSET:	return WEVENT_SZ(cuda_memset);
@@ -266,6 +272,7 @@ static inline const char *wevent_kind_name(enum event_kind kind)
 	case EV_REQ_EVENT:	return "req_event";
 	case EV_REQ_TASK_EVENT:	return "req_task_event";
 	case EV_SCX_DSQ_END:	return "scx_dsq_end";
+	case EV_USDT:		return "usdt";
 	case EV_CUDA_CALL:	return "cuda_call";
 	case EV_CUDA_KERNEL:	return "cuda_kernel";
 	case EV_CUDA_MEMCPY:	return "cuda_memcpy";

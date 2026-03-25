@@ -85,6 +85,7 @@ enum event_kind {
 	EV_REQ_EVENT = 16,
 	EV_REQ_TASK_EVENT = 17,
 	EV_SCX_DSQ_END = 18,
+	EV_USDT = 19,
 
 	EV_CUDA_CALL = 49,
 
@@ -282,6 +283,10 @@ struct wprof_event {
 			u32 scx_layer_id;
 			enum scx_dsq_insert_type scx_dsq_insert_type;
 		} scx_dsq;
+		struct wprof_usdt {
+			u64 arg0, arg1, arg2, arg3;
+			u16 usdt_id; /* index into usdt_probes[], set via cookie */
+		} usdt;
 		struct wprof_cuda_call {
 			int domain;
 			int cbid;

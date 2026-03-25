@@ -50,6 +50,7 @@
 #include "inject.h"
 #include "inj_common.h"
 #include "merge.h"
+#include "usdt.h"
 #include "../libbpf/src/strset.h"
 #include "pystacks.h"
 #include "pysym.h"
@@ -508,6 +509,16 @@ static int setup_bpf(struct bpf_state *st, struct worker_state *workers, int num
 		}
 	}
 
+	if (env.usdt_probe_cnt > 0) {
+		err = setup_usdt_discovery();
+		if (err) {
+			eprintf("USDT probe discovery step failed: %d\n", err);
+			return err;
+		}
+		if (env.usdt_binaries)
+			bpf_program__set_autoload(skel->progs.wprof_usdt, true);
+	}
+
 	if (env.req_binaries) {
 		bpf_program__set_autoload(skel->progs.wprof_req_ctx, true);
 		if (env.capture_req_experimental) {
@@ -928,6 +939,14 @@ static int attach_bpf(struct bpf_state *st, struct worker_state *workers, int nu
 		}
 	}
 
+	if (env.usdt_binaries) {
+		err = attach_usdt_probes(st);
+		if (err) {
+			eprintf("Failed to attach generic USDT probes: %d\n", err);
+			return err;
+		}
+	}
+
 	/* spin up and ready ringbuf consumer threads */
 	st->rb_threads = calloc(env.ringbuf_cnt, sizeof(*st->rb_threads));
 
@@ -1210,6 +1229,16 @@ int main(int argc, char **argv)
 			for (int i = 0; i < ARRAY_SIZE(capture_features); i++) {
 				const struct capture_feature *f = &capture_features[i];
 				wprintf("%-*s%s\n", w, f->header, f->cfg_get_flag(cfg) ? "YES" : "NO");
+			}
+
+			if (dump_hdr->usdt_def_cnt > 0) {
+				wprintf("%-*s\n", w, "USDT probes:");
+				for (u32 i = 0; i < dump_hdr->usdt_def_cnt; i++) {
+					struct wevent_usdt_def *def = wevent_usdt_def(dump_hdr, i);
+					wprintf("%-*s%s:%s\n", w, "",
+						wevent_str(dump_hdr, def->provider_stroff),
+						wevent_str(dump_hdr, def->name_stroff));
+				}
 			}
 
 			u64 kind_cnt[__EV_KIND_MAX] = {};

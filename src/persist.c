@@ -85,6 +85,7 @@ void persist_state_free(struct persist_state *ps)
 	}
 	free(ps->threads.entries);
 	free(ps->pmu_defs);
+	free(ps->usdt_defs);
 	strset__free(ps->strs);
 
 	if (ps->tid_cache) {
@@ -175,6 +176,18 @@ int persist_add_pmu_def(struct persist_state *ps, const struct pmu_event *ev)
 
 	ps->pmu_def_total_cnt += 1;
 	return ps->pmu_def_total_cnt - 1;
+}
+
+int persist_add_usdt_def(struct persist_state *ps, const char *provider, const char *name)
+{
+	ps->usdt_defs = realloc(ps->usdt_defs, (ps->usdt_def_cnt + 1) * sizeof(*ps->usdt_defs));
+
+	struct wevent_usdt_def *def = &ps->usdt_defs[ps->usdt_def_cnt];
+	def->provider_stroff = persist_stroff(ps, provider);
+	def->name_stroff = persist_stroff(ps, name);
+
+	ps->usdt_def_cnt += 1;
+	return ps->usdt_def_cnt - 1;
 }
 
 static void fill_wevent_hdr(struct wevent *dst, const struct wprof_event *e, u32 task_id, u16 sz)
@@ -342,6 +355,16 @@ int persist_bpf_event(struct persist_state *ps, const struct wprof_event *e, str
 		dst->scx_dsq.scx_dsq_id = e->scx_dsq.scx_dsq_id;
 		dst->scx_dsq.scx_layer_id = e->scx_dsq.scx_layer_id;
 		dst->scx_dsq.scx_dsq_insert_type = e->scx_dsq.scx_dsq_insert_type;
+		break;
+
+	case EV_USDT:
+		fill_wevent_hdr(dst, e, task_id, WEVENT_SZ(usdt));
+
+		dst->usdt.arg0 = e->usdt.arg0;
+		dst->usdt.arg1 = e->usdt.arg1;
+		dst->usdt.arg2 = e->usdt.arg2;
+		dst->usdt.arg3 = e->usdt.arg3;
+		dst->usdt.usdt_id = e->usdt.usdt_id;
 		break;
 
 	/* ephemeral */

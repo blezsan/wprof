@@ -2129,6 +2129,75 @@ static const char *scx_dsq_insert_type_str(enum scx_dsq_insert_type type)
 	}
 }
 
+/* EV_USDT */
+static const char *usdt_probe_fullname(struct wprof_data_hdr *hdr, u16 usdt_id)
+{
+	if (usdt_id >= hdr->usdt_def_cnt)
+		return "usdt:unknown";
+
+	struct wevent_usdt_def *def = wevent_usdt_def(hdr, usdt_id);
+	return sfmt("%s:%s",
+		    wevent_str(hdr, def->provider_stroff),
+		    wevent_str(hdr, def->name_stroff));
+}
+
+static void emit_usdt_event(struct worker_state *w, const struct wevent *e)
+{
+	struct wprof_data_hdr *hdr = w->dump_hdr;
+	struct wprof_task task = wevent_resolve_task(hdr, e->task_id);
+
+	emit_track_descrs(w, &task);
+
+	const char *name = usdt_probe_fullname(hdr, e->usdt.usdt_id);
+	pb_iid name_iid = emit_intern_str(w, name);
+
+	emit_instant(trackid_thread_kernel(&task), e->ts,
+		     iid_str(name_iid, name), IID_CAT_USDT) {
+		emit_kv_int(IID_ANNK_CPU, e->cpu);
+		if (env.emit_numa)
+			emit_kv_int(IID_ANNK_NUMA_NODE, e->numa_node);
+		emit_kv_int(IID_ANNK_USDT_ARG0, e->usdt.arg0);
+		emit_kv_int(IID_ANNK_USDT_ARG1, e->usdt.arg1);
+		emit_kv_int(IID_ANNK_USDT_ARG2, e->usdt.arg2);
+		emit_kv_int(IID_ANNK_USDT_ARG3, e->usdt.arg3);
+	}
+}
+
+static void emit_usdt_json(struct worker_state *w, const struct wevent *e)
+{
+	struct json_state *j = &js;
+	struct wprof_data_hdr *hdr = w->dump_hdr;
+	struct wprof_task task = wevent_resolve_task(hdr, e->task_id);
+
+	json_obj_start(j);
+	json_kv_ts(j, "ts", e->ts - env.sess_start_ts);
+	json_kv_str(j, "t", "usdt");
+	json_task(j, "task", &task);
+	json_kv_int(j, "cpu", e->cpu);
+	if (env.emit_numa)
+		json_kv_int(j, "numa", e->numa_node);
+	json_kv_str(j, "probe", usdt_probe_fullname(hdr, e->usdt.usdt_id));
+	json_kv_int(j, "arg0", e->usdt.arg0);
+	json_kv_int(j, "arg1", e->usdt.arg1);
+	json_kv_int(j, "arg2", e->usdt.arg2);
+	json_kv_int(j, "arg3", e->usdt.arg3);
+	json_obj_end(j);
+}
+
+static int process_usdt(struct worker_state *w, const struct wevent *e)
+{
+	struct wprof_task task = wevent_resolve_task(w->dump_hdr, e->task_id);
+
+	if (!should_trace_task(&task))
+		return 0;
+
+	if (env.json_path)
+		emit_usdt_json(w, e);
+	else
+		emit_usdt_event(w, e);
+	return 0;
+}
+
 /* EV_SCX_DSQ_END */
 static void emit_scx_dsq_end(struct worker_state *w, const struct wevent *e)
 {
@@ -3232,6 +3301,7 @@ static handle_event_fn emit_fns[] = {
 	[EV_REQ_EVENT] = process_req_event,
 	[EV_REQ_TASK_EVENT] = process_req_task_event,
 	[EV_SCX_DSQ_END] = process_scx_dsq_end,
+	[EV_USDT] = process_usdt,
 	[EV_CUDA_KERNEL] = process_cuda_kernel,
 	[EV_CUDA_MEMCPY] = process_cuda_memcpy,
 	[EV_CUDA_MEMSET] = process_cuda_memset,

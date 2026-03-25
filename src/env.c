@@ -89,6 +89,8 @@ enum {
 	OPT_REQ_FILTER = 3004,
 	OPT_REQ_TOP_N = 3005,
 	OPT_REQ_BOTTOM_N = 3006,
+
+	OPT_USDT = 4000,
 };
 
 static const struct argp_option opts[] = {
@@ -157,6 +159,10 @@ static const struct argp_option opts[] = {
 	{ "req-filter", OPT_REQ_FILTER, "EXPR", 0, "Filter requests: <field><op><value> (e.g., latency>1ms, pid=1234, name=foo). Repeatable." },
 	{ "req-top-n", OPT_REQ_TOP_N, "N", 0, "Show only the first N requests" },
 	{ "req-bottom-n", OPT_REQ_BOTTOM_N, "N", 0, "Show only the last N requests" },
+
+	/* USDT tracing */
+	{ "usdt", OPT_USDT, "PROVIDER:NAME[=PID|PATH]", 0,
+	  "Trace arbitrary USDT probe. Format: provider:name[=PID|PATH]. Repeatable." },
 	{},
 };
 
@@ -650,6 +656,55 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			eprintf("Invalid --req-bottom-n value: '%s'\n", arg);
 			return -EINVAL;
 		}
+		break;
+	}
+	case OPT_USDT: {
+		/* Parse provider:name[=target] */
+		char *colon = strchr(arg, ':');
+		if (!colon || colon == arg) {
+			eprintf("Invalid --usdt format '%s', expected provider:name[=PID|PATH]\n", arg);
+			return -EINVAL;
+		}
+
+		char *name_start = colon + 1;
+		if (!*name_start) {
+			eprintf("Invalid --usdt format '%s', missing probe name after ':'\n", arg);
+			return -EINVAL;
+		}
+
+		/* Check for =target suffix on the name part */
+		char *eq = strchr(name_start, '=');
+
+		env.usdt_probes = realloc(env.usdt_probes,
+					  (env.usdt_probe_cnt + 1) * sizeof(*env.usdt_probes));
+		struct usdt_probe_def *probe = &env.usdt_probes[env.usdt_probe_cnt];
+		memset(probe, 0, sizeof(*probe));
+
+		probe->provider = strndup(arg, colon - arg);
+		probe->name = eq ? strndup(name_start, eq - name_start) : strdup(name_start);
+
+		if (eq) {
+			const char *target = eq + 1;
+			int pid, n;
+
+			if (sscanf(target, "%d %n", &pid, &n) == 1 && target[n] == '\0') {
+				err = append_num(&probe->pids, &probe->pid_cnt, target);
+				if (err) {
+					eprintf("Failed to record PID '%s' for USDT probe!\n", target);
+					return err;
+				}
+			} else {
+				err = append_str(&probe->paths, &probe->path_cnt, target);
+				if (err) {
+					eprintf("Failed to record path '%s' for USDT probe!\n", target);
+					return err;
+				}
+			}
+		} else {
+			probe->global_discovery = true;
+		}
+
+		env.usdt_probe_cnt++;
 		break;
 	}
 	case ARGP_KEY_ARG:

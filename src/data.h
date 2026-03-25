@@ -6,6 +6,7 @@
 #include "wprof_types.h"
 #include "wprof.h"
 #include "wevent.h"
+#include "usdt.h"
 #include "pmu.h"
 
 #define WPROF_DATA_MAJOR 2
@@ -54,6 +55,10 @@ struct wprof_data_hdr {
 
 	/* Symbolized stack traces section */
 	u64 stacks_off, stacks_sz;
+
+	/* USDT probe definitions section */
+	u64 usdt_defs_off, usdt_defs_sz;
+	u32 usdt_def_cnt;
 
 	struct wprof_data_cfg cfg;
 } __attribute__((aligned(8)));
@@ -167,6 +172,12 @@ static inline void wevent_pmu_to_event(struct wprof_data_hdr *hdr, u32 idx, stru
 	ev->config1 = def->config1;
 	ev->config2 = def->config2;
 	snprintf(ev->name, sizeof(ev->name), "%s", wevent_str(hdr, def->name_stroff));
+}
+
+static inline struct wevent_usdt_def *wevent_usdt_def(const struct wprof_data_hdr *hdr, u32 idx)
+{
+	struct wevent_usdt_def *defs = (void *)hdr + hdr->hdr_sz + hdr->usdt_defs_off;
+	return &defs[idx];
 }
 
 

@@ -1510,3 +1510,33 @@ int BPF_USDT(wprof_cuda_call, int domain, int cbid, __u32 corr_id)
 
 	return 0;
 }
+
+/* Generic USDT probe handler */
+SEC("?usdt")
+int wprof_usdt(struct pt_regs *ctx)
+{
+	u64 now_ts = bpf_ktime_get_ns();
+	struct task_struct *task = bpf_get_current_task_btf();
+
+	if (!should_trace_task(task, now_ts))
+		return 0;
+
+	u64 args[4] = {};
+	bpf_usdt_arg(ctx, 0, &args[0]);
+	bpf_usdt_arg(ctx, 1, &args[1]);
+	bpf_usdt_arg(ctx, 2, &args[2]);
+	bpf_usdt_arg(ctx, 3, &args[3]);
+
+	u64 usdt_id = bpf_usdt_cookie(ctx);
+
+	struct wprof_event *e;
+	emit_task_event(e, EV_SZ(usdt), 0, EV_USDT, now_ts, task) {
+		e->usdt.arg0 = args[0];
+		e->usdt.arg1 = args[1];
+		e->usdt.arg2 = args[2];
+		e->usdt.arg3 = args[3];
+		e->usdt.usdt_id = (u16)usdt_id;
+	}
+
+	return 0;
+}

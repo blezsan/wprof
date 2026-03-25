@@ -10,6 +10,17 @@
 #include "cuda.h"
 #include "requests.h"
 
+struct usdt_probe_def {
+	char *provider;
+	char *name;
+	/* binary discovery targets */
+	int pid_cnt;
+	int *pids;
+	int path_cnt;
+	char **paths;
+	bool global_discovery;
+};
+
 #define WPROF_VERSION "0.3-dev"
 
 #define DEFAULT_RINGBUF_SZ (16 * 1024 * 1024)
@@ -150,6 +161,11 @@ struct env {
 
 	/* persisted data header, set after merge or before replay */
 	struct wprof_data_hdr *data_hdr;
+
+	/* USDT tracing */
+	int usdt_probe_cnt;
+	struct usdt_probe_def *usdt_probes;
+	struct hashmap *usdt_binaries;
 };
 
 extern struct env env;
